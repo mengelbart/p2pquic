@@ -16,8 +16,13 @@ go run cmd/main.go -server -ice
 In the second one run:
 
 ```shell
-go run cmd/main.go -ice -local 9001 -remote 9000
+go run cmd/main.go -ice
 ```
+
+Both processes will print a base64 encoded signaling string. Copy the string
+from the first to stdin of the second terminal and the signaling string from the
+second to stdin of the first terminal. In a real app, this would be done by a
+signaling server, e.g., by using HTTP or WebSockets.
 
 When both processes are running, press enter in both terminals. You should see
 some log messages about ICE connection states and candidates. When the

@@ -3,21 +3,25 @@ package p2pquic
 import (
 	"bufio"
 	"context"
+	"encoding/base64"
+	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"net/http"
-	"net/url"
 	"os"
+	"strings"
 
 	"github.com/pion/ice/v2"
 )
 
 type ICESignalingServer struct {
-	agent      *ice.Agent
-	remoteChan chan string
-	remotePort int
-	localPort  int
+	agent         *ice.Agent
+	candidateChan chan ice.Candidate
+	remoteChan    chan string
+	remotePort    int
+	localPort     int
 }
 
 func NewICESignalingServer(remotePort, localPort int) (*ICESignalingServer, error) {
@@ -28,35 +32,17 @@ func NewICESignalingServer(remotePort, localPort int) (*ICESignalingServer, erro
 		return nil, err
 	}
 	return &ICESignalingServer{
-		agent:      iceAgent,
-		remoteChan: make(chan string, 3),
-		remotePort: remotePort,
-		localPort:  localPort,
+		agent:         iceAgent,
+		candidateChan: make(chan ice.Candidate),
+		remoteChan:    make(chan string, 3),
+		remotePort:    remotePort,
+		localPort:     localPort,
 	}, nil
 }
 
 func (s *ICESignalingServer) setup() error {
-	http.HandleFunc("/remoteAuth", s.remoteAuthHandler(s.remoteChan))
-	http.HandleFunc("/remoteCandidate", s.remoteCandidateHandler(s.agent))
-
-	go func() {
-		if err := http.ListenAndServe(fmt.Sprintf(":%d", s.localPort), nil); err != nil {
-			panic(err)
-		}
-	}()
-
 	if err := s.agent.OnCandidate(func(c ice.Candidate) {
-		if c == nil {
-			return
-		}
-		log.Printf("got candidate: %v\n", c.String())
-		_, err := http.PostForm(fmt.Sprintf("http://localhost:%d/remoteCandidate", s.remotePort), //nolint
-			url.Values{
-				"candidate": {c.Marshal()},
-			})
-		if err != nil {
-			panic(err)
-		}
+		s.candidateChan <- c
 	}); err != nil {
 		return err
 	}
@@ -69,38 +55,62 @@ func (s *ICESignalingServer) setup() error {
 	return nil
 }
 
+type Signal struct {
+	Ufrag      string   `json:"ufrag"`
+	Pwd        string   `json:"pwd"`
+	Candidates []string `json:"candidates"`
+}
+
 func (s *ICESignalingServer) run(controlling bool) (net.PacketConn, error) {
-	fmt.Print("Press 'Enter' when both processes have started")
-	if _, err := bufio.NewReader(os.Stdin).ReadBytes('\n'); err != nil {
-		return nil, err
-	}
 	// Get the local auth details and send to remote peer
 	localUfrag, localPwd, err := s.agent.GetLocalUserCredentials()
 	if err != nil {
 		return nil, err
 	}
 
-	_, err = http.PostForm(fmt.Sprintf("http://localhost:%d/remoteAuth", s.remotePort), //nolint
-		url.Values{
-			"ufrag": {localUfrag},
-			"pwd":   {localPwd},
-		})
-	if err != nil {
-		return nil, err
-	}
-
-	log.Printf("waiting for remote")
-
-	remoteUfrag := <-s.remoteChan
-	remotePwd := <-s.remoteChan
-
 	s.agent.GatherCandidates()
 
+	var cs []string
+	for c := range s.candidateChan {
+		if c == nil {
+			break
+		}
+		cs = append(cs, c.Marshal())
+	}
+	sig := Signal{
+		Ufrag:      localUfrag,
+		Pwd:        localPwd,
+		Candidates: cs,
+	}
+	fmt.Println("local signal:")
+	fmt.Println(Encode(sig))
+	log.Printf("waiting for remote signal")
+
+	var remoteSignal Signal
+	Decode(MustReadStdin(), &remoteSignal)
+
+	log.Printf("got remote signal: %v", remoteSignal)
+
+	for _, c := range remoteSignal.Candidates {
+		var candidate ice.Candidate
+		candidate, err = ice.UnmarshalCandidate(c)
+		if err != nil {
+			panic(err)
+		}
+		if err = s.agent.AddRemoteCandidate(candidate); err != nil {
+			panic(err)
+		}
+	}
+
+	fmt.Print("Press 'Enter' when both processes are ready")
+	if _, err = bufio.NewReader(os.Stdin).ReadBytes('\n'); err != nil {
+		return nil, err
+	}
 	var conn *ice.Conn
 	if controlling {
-		conn, err = s.agent.Accept(context.TODO(), remoteUfrag, remotePwd)
+		conn, err = s.agent.Accept(context.TODO(), remoteSignal.Ufrag, remoteSignal.Pwd)
 	} else {
-		conn, err = s.agent.Dial(context.TODO(), remoteUfrag, remotePwd)
+		conn, err = s.agent.Dial(context.TODO(), remoteSignal.Ufrag, remoteSignal.Pwd)
 	}
 	if err != nil {
 		return nil, err
@@ -157,14 +167,51 @@ func (s *ICESignalingServer) remoteCandidateHandler(iceAgent *ice.Agent) http.Ha
 	}
 }
 
-// HTTP Listener to get ICE Credentials from remote Peer
-func (s *ICESignalingServer) remoteAuthHandler(remoteAuthChannel chan<- string) http.HandlerFunc {
-	return func(_ http.ResponseWriter, r *http.Request) {
-		if err := r.ParseForm(); err != nil {
-			panic(err)
-		}
-
-		remoteAuthChannel <- r.PostForm["ufrag"][0]
-		remoteAuthChannel <- r.PostForm["pwd"][0]
+// Encode encodes the input in base64
+// It can optionally zip the input before encoding
+func Encode(obj interface{}) string {
+	b, err := json.Marshal(obj)
+	if err != nil {
+		panic(err)
 	}
+
+	return base64.StdEncoding.EncodeToString(b)
+}
+
+// Decode decodes the input from base64
+// It can optionally unzip the input after decoding
+func Decode(in string, obj interface{}) {
+	b, err := base64.StdEncoding.DecodeString(in)
+	if err != nil {
+		panic(err)
+	}
+
+	err = json.Unmarshal(b, obj)
+	if err != nil {
+		panic(err)
+	}
+}
+
+// MustReadStdin blocks until input is received from stdin
+func MustReadStdin() string {
+	r := bufio.NewReader(os.Stdin)
+
+	var in string
+	for {
+		var err error
+		in, err = r.ReadString('\n')
+		if err != io.EOF {
+			if err != nil {
+				panic(err)
+			}
+		}
+		in = strings.TrimSpace(in)
+		if len(in) > 0 {
+			break
+		}
+	}
+
+	fmt.Println("")
+
+	return in
 }
